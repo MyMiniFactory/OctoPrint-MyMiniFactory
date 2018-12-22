@@ -11,7 +11,7 @@ or manually using this URL:
 
 ## Setup
 
-Once installed go into OctoPrint Settings > MyMiniFactory&reg; and select your connected printer's manufacturer and model and click the register button.  A QR code will be generated that can be scanned in the MyMiniFactory&reg; mobile application and associates with your account. Once registration is complete the printer should be listed in the mobile application as either Free, Busy, or Offline based on the current state.
+Once installed go into OctoPrint Settings > MyMiniFactory&reg; and select your connected printer's manufacturer and model and click the register button.  A QR code will be generated that can be scanned in the MyMiniFactory&reg; mobile application ([Android](https://play.google.com/store/apps/details?id=com.myminifactoryapps&hl=en) or [iOS](https://itunes.apple.com/us/app/myminifactory/id1313773617?mt=8)) and associates with your account. Once registration is complete the printer should be listed in the mobile application as either Free, Busy, or Offline based on the current state.
 
 ## Printing
 
@@ -19,7 +19,7 @@ From within the mobile application find a verified __Click & Print__ model and c
 
 ## Disclaimer
 
-This plugin adds a tab to the OctoPrint interface that loads the MyMiniFactory&reg; website within an iframe with consent from My Mini Factory Ltd.
+This plugin adds a tab to the OctoPrint interface that loads the MyMiniFactory&reg; website within an iframe with consent from My Mini Factory Ltd. It was built by [jneilliii](https://github.com/jneilliii) using the [MyMiniFactory API](https://www.myminifactory.com/pages/for-developers).
 
 The MyMiniFactory&reg; name, logo, website, and the __Click & Print__ service is copyright, trademark, and owned by My Mini Factory Ltd., see their [Terms and Conditions](https://www.myminifactory.com/pages/terms-and-conditions) for additional information regarding the use of their website and service(s).
 

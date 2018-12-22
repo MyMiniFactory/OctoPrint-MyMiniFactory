@@ -16,11 +16,16 @@ $(function() {
 
 		self.printer_model = ko.observable();
 		self.printer_manufacturer = ko.observable();
+		self.printer_serial_number = ko.observable();
 		self.supported_printers = ko.observableArray();
+		self.printer_token = ko.observable();
 		self.registering = ko.observable(false);
 		self.forgetting = ko.observable(false);
 		self.registration_complete = ko.observable();
 		self.qr_image_url = ko.observable('');
+		self.mmf_print_complete = ko.observable();
+		self.mmf_print_cancelled = ko.observable();
+		self.bypass_bed_clear = ko.observable();
 		self.supported_manufacturers = ko.computed(function() {
 				var seen =[];
 				return ko.utils.arrayFilter(self.supported_printers(), function(item) {
@@ -42,11 +47,19 @@ $(function() {
 			self.supported_printers(self.settingsViewModel.settings.plugins.myminifactory.supported_printers());
 			self.printer_model(self.settingsViewModel.settings.plugins.myminifactory.printer_model());
 			self.printer_manufacturer(self.settingsViewModel.settings.plugins.myminifactory.printer_manufacturer());
+			self.printer_serial_number(self.settingsViewModel.settings.plugins.myminifactory.printer_serial_number());
+			self.printer_token(self.settingsViewModel.settings.plugins.myminifactory.printer_token());
+			self.mmf_print_complete(self.settingsViewModel.settings.plugins.myminifactory.mmf_print_complete());
+			self.mmf_print_cancelled(self.settingsViewModel.settings.plugins.myminifactory.mmf_print_cancelled());
+			self.bypass_bed_clear(self.settingsViewModel.settings.plugins.myminifactory.bypass_bed_clear());
 		}
 		
-		self.onSettingsShown = function() {
-			if(self.registration_complete()){
-				self.get_qr_image_url();
+		self.onAfterBinding = function() {
+			if(self.mmf_print_complete()){
+				self.onDataUpdaterPluginMessage('myminifactory',{'mmf_print_complete':true});
+			}
+			if(self.mmf_print_cancelled()){
+				self.onDataUpdaterPluginMessage('myminifactory',{'mmf_print_cancelled':true});
 			}
 		}
 		
@@ -60,12 +73,20 @@ $(function() {
 			self.supported_printers(self.settingsViewModel.settings.plugins.myminifactory.supported_printers());
 			self.printer_model(self.settingsViewModel.settings.plugins.myminifactory.printer_model());
 			self.printer_manufacturer(self.settingsViewModel.settings.plugins.myminifactory.printer_manufacturer());
+			self.printer_serial_number(self.settingsViewModel.settings.plugins.myminifactory.printer_serial_number());
+			self.printer_token(self.settingsViewModel.settings.plugins.myminifactory.printer_token());
+			self.mmf_print_complete(self.settingsViewModel.settings.plugins.myminifactory.mmf_print_complete());
+			self.mmf_print_cancelled(self.settingsViewModel.settings.plugins.myminifactory.mmf_print_cancelled());
+			self.bypass_bed_clear(self.settingsViewModel.settings.plugins.myminifactory.bypass_bed_clear());
 		}
 		
 		self.onSettingsBeforeSave = function() {
 			self.settingsViewModel.settings.plugins.myminifactory.supported_printers(self.supported_printers());
 			self.settingsViewModel.settings.plugins.myminifactory.printer_model(self.printer_model());
 			self.settingsViewModel.settings.plugins.myminifactory.printer_manufacturer(self.printer_manufacturer());
+			self.settingsViewModel.settings.plugins.myminifactory.printer_serial_number(self.printer_serial_number());
+			self.settingsViewModel.settings.plugins.myminifactory.printer_token(self.printer_token());
+			self.settingsViewModel.settings.plugins.myminifactory.bypass_bed_clear(self.bypass_bed_clear());
 		}
 
 		self.onDataUpdaterPluginMessage = function(plugin, data) {
@@ -88,6 +109,7 @@ $(function() {
 				console.log(data.qr_image_url);
 				self.registering(false);
 				self.qr_image_url(data.qr_image_url);
+				self.printer_serial_number(data.printer_serial_number);
 				self.registration_complete(true);
 				return;
 			}
@@ -96,6 +118,44 @@ $(function() {
 				self.qr_image_url('');
 				self.registration_complete(false);
 				self.forgetting(false);
+				self.printer_serial_number('');
+				$("#MyMiniFactoryForgetWarning").modal("hide");
+			}
+			
+			if(data.mmf_print_complete || data.mmf_print_cancelled){
+				self.notify = new PNotify({
+						title: 'MyMiniFactory Click and Print',
+						type: 'info',
+						text: '<div class="row-fluid" style="padding-top: 20px;"><p>MyMiniFactory Click and Print job ' + (data.mmf_print_complete ? 'complete' : 'cancelled') + '. Please clear the bed and press Ok below to free up the printer again.</p></div>',
+						hide: false,
+						buttons: {
+							closer: false,
+							sticker: false
+						},
+						confirm: {
+							confirm: true,
+							buttons: [{
+								text: 'Ok',
+								addClass: 'btn-primary',
+								click: function(notice) {
+									$.ajax({
+										url: API_BASEURL + "plugin/myminifactory",
+										type: "POST",
+										dataType: "json",
+										data: JSON.stringify({
+											command: "mmf_print_complete"
+										}),
+										contentType: "application/json; charset=UTF-8"
+									}).done(function(data){
+												if(data.bed_cleared){
+													notice.remove();
+													self.mmf_print_complete(true);
+												}
+											});
+								}
+							},{addClass: 'hidden'}]
+						}
+						});
 			}
 		}
 		
@@ -123,10 +183,18 @@ $(function() {
 				contentType: "application/json; charset=UTF-8"
 			});
 		}
+		
+		self.cancelClick = function(data) {
+			self.forgetting(false);
+		}
+		
+		self.confirm_forget = function(){
+			self.forgetting(true);
+			$("#MyMiniFactoryForgetWarning").modal("show");
+		}
 
 		self.forget_registration = function(){
 			console.log('Removing configured printer locally.');
-			self.forgetting(true);
 			$.ajax({
 				url: API_BASEURL + "plugin/myminifactory",
 				type: "POST",
@@ -135,6 +203,24 @@ $(function() {
 					command: "forget_printer"
 				}),
 				contentType: "application/json; charset=UTF-8"
+			}).done(function(response){
+				if (response.printer_removed){
+					console.log('Printer forgotten, reloading list of supported printers.');
+					console.log(response.supported_printers);
+					self.qr_image_url('');
+					self.registration_complete(false);
+					self.forgetting(false);
+					self.printer_serial_number('');
+					new_supported_printers = ko.utils.arrayMap(response.supported_printers,function(item){
+						var new_item = {}
+						for (x in item){
+							new_item[x] = ko.observable(item[x]);
+						}
+						return new_item;
+					});
+					self.supported_printers(new_supported_printers);
+					$("#MyMiniFactoryForgetWarning").modal("hide");
+				}
 			});
 		}
 	}

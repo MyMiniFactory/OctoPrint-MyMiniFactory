@@ -3,10 +3,12 @@ from __future__ import absolute_import
 from uuid import getnode as get_mac
 from octoprint.server import user_permission
 from octoprint.util import RepeatedTimer
+from octoprint.util import version
 from octoprint.events import Events
 from octoprint.filemanager.analysis import QueueEntry
 from datetime import datetime
 import requests
+import flask
 import json
 import time
 import octoprint.plugin
@@ -26,15 +28,17 @@ class MyMiniFactoryPlugin(octoprint.plugin.SettingsPlugin,
 		self._mqtt_tls_set = False
 		self._current_task_id = None
 		self.mmf_status_updater = None
-		self._current_action_code = "000"
+		self._current_action_code = "999"
 		self._current_temp_hotend = 0
 		self._current_temp_bed = 0
+		self._mmf_print = False
 		self._printer_status = {"000":"free",
 								"100":"prepare",
 								"101":"printing",
-								"102":"printing",
+								"102":"paused",
 								"103":"free",
-								"104":"printing"}
+								"104":"printing",
+								"999":"offline"}
 
 	def initialize(self):
 		self._printer.register_callback(self)
@@ -51,8 +55,11 @@ class MyMiniFactoryPlugin(octoprint.plugin.SettingsPlugin,
 			registration_complete = False,
 			printer_token = "",
 			client_name = "octoprint_myminifactory",
-			client_key = "b4943605-52b5-4d13-94ee-34eb983a813f",
-			auto_start_print = True
+			client_key = "acGxgLJmvgTZU2RDZ3vQaiitxc5Bf6DDeHL1", #"b4943605-52b5-4d13-94ee-34eb983a813f"
+			auto_start_print = True,
+			mmf_print_complete = False,
+			mmf_print_cancelled = False,
+			bypass_bed_clear = False
 		)
 
 	def get_settings_version(self):
@@ -66,30 +73,42 @@ class MyMiniFactoryPlugin(octoprint.plugin.SettingsPlugin,
 	def on_event(self, event, payload):
 		if event == Events.PRINT_STARTED:
 			self._current_action_code = "101"
+			self._settings.set_boolean(["mmf_print_complete"],False)
+			self._settings.set_boolean(["mmf_print_cancelled"],False)
+			self._settings.save()
+			if not self._mmf_print:
+				self._current_task_id = None
 		elif event == Events.PRINT_DONE:
-			self._current_action_code = "000"
+			if self._mmf_print and not self._settings.get_boolean(["bypass_bed_clear"]): # Send message back to UI to confirm clearing of bed.
+				self._settings.set_boolean(["mmf_print_complete"],True)
+				self._settings.save()
+				self._plugin_manager.send_plugin_message(self._identifier, dict(mmf_print_complete=True))
+			else:
+				self._current_action_code = "000"
+				self._mmf_print = False
 		elif event == Events.PRINT_CANCELLED:
-			self._current_action_code = "000"
+			if self._mmf_print and not self._settings.get_boolean(["bypass_bed_clear"]): # Send message back to UI to confirm clearing of bed.
+				self._settings.set_boolean(["mmf_print_cancelled"],True)
+				self._settings.save()
+				self._plugin_manager.send_plugin_message(self._identifier, dict(mmf_print_cancelled=True))
+			else:
+				self._current_action_code = "000"
+				self._mmf_print = False
 		if event == Events.PRINT_PAUSED:
-			self._current_action_code = "101"
+			self._current_action_code = "102"
 		if event == Events.PRINT_RESUMED:
 			self._current_action_code = "101"
 
 	##~~ StartupPlugin mixin
 
 	def on_startup(self, host, port):
-		self.mqtt_connect()
-		
-		if not self._settings.get_boolean(["registration_complete"]):
-			url = "https://www.myminifactory.com/api/v2/printers?automatic_slicing=1"
-			headers = {'X-Api-Key': self._settings.get(["client_key"])}
-			response = requests.get(url, headers=headers)
-			if response.status_code == 200:
-				self._logger.debug("Received printers: %s" % response.text)
-				filtered_printers = list(filter(lambda d: d['model'], json.loads(response.text)["items"]))
-				self._settings.set(["supported_printers"],filtered_printers)
-			else:
-				self._logger.debug("Error getting printers: %s" % response)
+		if self._settings.get_boolean(["mmf_print_complete"]) == False and self._settings.get_boolean(["mmf_print_cancelled"]) == False:
+			self._current_action_code = "000"
+
+		if self._settings.get_boolean(["registration_complete"]):
+			self.mqtt_connect()
+		else:
+			self._settings.set(["supported_printers"],self.get_supported_printers())
 
 	def on_after_startup(self):
 		if self._mqtt is None:
@@ -117,12 +136,11 @@ class MyMiniFactoryPlugin(octoprint.plugin.SettingsPlugin,
 	##~~ SimpleApiPlugin mixin
 
 	def get_api_commands(self):
-		return dict(register_printer=["manufacturer","model"],forget_printer=[])
+		return dict(register_printer=["manufacturer","model"],forget_printer=[],mmf_print_complete=[])
 
 	def on_api_command(self, command, data):
 		if not user_permission.can():
-			from flask import make_response
-			return make_response("Insufficient rights", 403)
+			return flask.make_response("Insufficient rights", 403)
 
 		if command == "register_printer":
 			# Generate serial number if it doesn't already exist.
@@ -150,29 +168,51 @@ class MyMiniFactoryPlugin(octoprint.plugin.SettingsPlugin,
 					self._settings.save()
 					self.mqtt_connect()
 					self.on_after_startup()
-				self._plugin_manager.send_plugin_message(self._identifier, dict(qr_image_url=serialized_response["qr_image_url"]))
+				self._plugin_manager.send_plugin_message(self._identifier, dict(qr_image_url=serialized_response["qr_image_url"],printer_serial_number=self._settings.get(["printer_serial_number"])))
 			else:
 				self._logger.debug("API Error: %s" % response)
 				self._plugin_manager.send_plugin_message(self._identifier, dict(error=response.status_code))
 				
 		if command == "forget_printer":
+			new_supported_printers = self.get_supported_printers()
+			self.mqtt_disconnect(force=True)
 			self._settings.set(["printer_serial_number"],"")
 			self._settings.set(["printer_token"],"")
 			self._settings.set_boolean(["registration_complete"], False)
+			self._settings.set(["supported_printers"],new_supported_printers)
 			self._settings.save()
-			self.mqtt_disconnect(force=True)
-			self._plugin_manager.send_plugin_message(self._identifier, dict(printer_removed=True))
+			#self._plugin_manager.send_plugin_message(self._identifier, dict(printer_removed=True))
+			return flask.jsonify({"printer_removed":True,"supported_printers":new_supported_printers})
+			
+		if command == "mmf_print_complete":
+			self._mmf_print = False
+			self._current_action_code = "000"
+			self._settings.set_boolean(["mmf_print_complete"],False)
+			self._settings.set_boolean(["mmf_print_cancelled"],False)
+			self._settings.save()
+			return flask.jsonify(bed_cleared=True)
 
 	##~~ PrinterCallback
 
 	def on_printer_add_temperature(self, data):
 		if self._settings.get_boolean(["registration_complete"]):
-			if data["tool0"]:
+			if data.get("tool0"):
 				self._current_temp_hotend = data["tool0"]["actual"]
-			if data["bed"]:
+			if data.get("bed"):
 				self._current_temp_bed = data["bed"]["actual"]
 
 	##~~ MyMiniFactory Functions
+
+	def get_supported_printers(self):
+		url = "https://www.myminifactory.com/api/v2/printers"
+		headers = {'X-Api-Key': self._settings.get(["client_key"])}
+		response = requests.get(url, headers=headers)
+		if response.status_code == 200:
+			self._logger.debug("Received printers: %s" % response.text)
+			filtered_printers = list(filter(lambda d: (d['model'] and d['automatic_slicing'] == 1), json.loads(response.text)["items"]))
+			return filtered_printers
+		else:
+			self._logger.debug("Error getting printers: %s" % response)
 
 	def send_status(self):
 		printer_disconnected = self._printer.is_closed_or_error()
@@ -215,23 +255,31 @@ class MyMiniFactoryPlugin(octoprint.plugin.SettingsPlugin,
 		payload = dict(task_id = action["task_id"],printer_token = self._settings.get(["printer_token"]))
 		headers = {'X-Api-Key': self._settings.get(["client_key"])}
 		self._logger.debug("Sending parameters: %s with header: %s" % (payload,headers))
-		response = requests.get(url, params=payload, headers=headers)
+		response = requests.get(url, params=payload, headers=headers, stream=True)
 
 		if response.status_code == 200:
 			# Save file to uploads folder
-			gcode_download_file = "%s/%s" % (self._settings.global_get_basefolder("uploads"),action["filename"])
+			gcode_file_name = self._file_manager.sanitize_name("local",action["filename"])
+			gcode_download_file = "%s/%s" % (self._settings.global_get_basefolder("uploads"),gcode_file_name)
 			self._logger.debug("Saving file: %s" % gcode_download_file)
 			with open(gcode_download_file, 'w') as f:
-				f.write(response.text)
+				for chunk in response.iter_content(chunk_size=1024): 
+					if chunk: # filter out keep-alive new chunks
+						f.write(chunk)
+						#f.write(response.text)
 				
 			# Add downloaded file to analysisqueue
 			printer_profile = self._printer_profile_manager.get("_default")
-			entry = QueueEntry(action["filename"],gcode_download_file,"gcode","local",gcode_download_file, printer_profile)
+			if version.get_octoprint_version() > version.get_comparable_version("1.3.9"):
+				entry = QueueEntry(gcode_file_name,gcode_download_file,"gcode","local",gcode_download_file, printer_profile, None)
+			else:
+				entry = QueueEntry(gcode_file_name,gcode_download_file,"gcode","local",gcode_download_file, printer_profile)
 			self._analysis_queue.enqueue(entry,high_priority=True) 
 
 			# Select file downloaded and start printing if auto_start_print is enabled and not already printing
 			if self._printer.is_ready():
-				self._printer.select_file(action["filename"], False, printAfterSelect=self._settings.get_boolean(["auto_start_print"]))
+				self._mmf_print = True
+				self._printer.select_file(gcode_file_name, False, printAfterSelect=self._settings.get_boolean(["auto_start_print"]))
 			else:
 				self._logger.debug("Printer not ready, not selecting file to print.")
 		else:
@@ -274,7 +322,6 @@ class MyMiniFactoryPlugin(octoprint.plugin.SettingsPlugin,
 		self._mqtt.on_message = self._on_mqtt_message
 
 		self._mqtt.connect_async(broker_url, broker_port, keepalive=broker_keepalive)
-		# self._mqtt.connect_async(broker_url, broker_port, keepalive=broker_keepalive)
 		if self._mqtt.loop_start() == mqtt.MQTT_ERR_INVAL:
 			self._logger.error("Could not start MQTT connection, loop_start returned MQTT_ERR_INVAL")
 
@@ -308,29 +355,36 @@ class MyMiniFactoryPlugin(octoprint.plugin.SettingsPlugin,
 		action = json.loads(message)
 		if action["action_code"] == "100":
 			self._logger.debug("received prepare command")
+			self._current_action_code = "100"
+			self.send_status()
+			time.sleep(10)
+			self._logger.debug("prepartion complete status set to free")
+			self._current_action_code = "000"
+			self.send_status()
 
 		if action["action_code"] == "101":
 			self._logger.debug("received print command")
-			self._current_action_code = "101"
+			# self._current_action_code = "101"
 			self._current_task_id = action["task_id"]
 			self.download_file(action)
 
 		if action["action_code"] == "102":
 			self._logger.debug("received pause command")
-			self._current_action_code = "102"
-			#self._current_task_id = action["task_id"]
-			self._printer.pause_print()
+			# self._current_action_code = "102"
+			if self._current_task_id:
+				self._printer.pause_print()
 
 		if action["action_code"] == "103":
 			self._logger.debug("received cancel command")
-			self._current_action_code = "103"
-			self._printer.cancel_print()
+			# self._current_action_code = "103"
+			if self._current_task_id:
+				self._printer.cancel_print()
 
 		if action["action_code"] == "104":
 			self._logger.debug("received resume command")
-			self._current_action_code = "104"
-			#self._current_task_id = action["task_id"]
-			self._printer.resume_print()
+			# self._current_action_code = "104"
+			if self._current_task_id:
+				self._printer.resume_print()
 
 		if action["action_code"] == "300":
 			self._logger.debug("received status update request")
@@ -389,21 +443,14 @@ class MyMiniFactoryPlugin(octoprint.plugin.SettingsPlugin,
 	##~~ Softwareupdate hook
 
 	def get_update_information(self):
-		# Define the configuration for your plugin to use with the Software Update
-		# Plugin here. See https://github.com/foosel/OctoPrint/wiki/Plugin:-Software-Update
-		# for details.
 		return dict(
 			MyMiniFactory=dict(
 				displayName="MyMiniFactory",
 				displayVersion=self._plugin_version,
-
-				# version check: github repository
 				type="github_release",
 				user="jneilliii",
 				repo="OctoPrint-MyMiniFactory",
 				current=self._plugin_version,
-
-				# update method: pip
 				pip="https://github.com/jneilliii/OctoPrint-MyMiniFactory/archive/{target_version}.zip"
 			)
 		)
